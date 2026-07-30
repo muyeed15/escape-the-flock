@@ -92,6 +92,16 @@ void free_map(int **map, int rows)
 
 /* file io */
 
+void lockfile(int fd)
+{
+	flock(fd, LOCK_EX);
+}
+
+void unlockfile(int fd)
+{
+	flock(fd, LOCK_UN);
+}
+
 int read_file_to_buffer(int fd, char *buf, int max_size)
 {
 	int total = 0, n;
@@ -456,8 +466,9 @@ int move_enemy_random(int **map, int rows, int cols, int *er, int *ec,
 	return 0;
 }
 
-/* processes */
+/* processes
 
+/* Child 1: Snake movement (every 2 seconds) */
 void snake_process(const char *state_file, int rows, int cols)
 {
 	int **map = allocate_map(rows, cols);
@@ -474,22 +485,22 @@ void snake_process(const char *state_file, int rows, int cols)
 	while (1) {
 		nanosleep(&ts, 0);
 
-		flock(fd, LOCK_EX);
+		lockfile(fd);
 
 		int state;
 		if (read_state_from_file(fd, map, rows, cols, &state) < 0) {
-			flock(fd, LOCK_UN);
+			unlockfile(fd);
 			break;
 		}
 
 		if (state != 0) {
-			flock(fd, LOCK_UN);
+			unlockfile(fd);
 			break;
 		}
 
 		if (find_position(map, rows, cols, 2, &pr, &pc) != 0 ||
 		    find_position(map, rows, cols, 4, &sr, &sc) != 0) {
-			flock(fd, LOCK_UN);
+			unlockfile(fd);
 			break;
 		}
 
@@ -499,7 +510,7 @@ void snake_process(const char *state_file, int rows, int cols)
 		if (attacked) new_state = 3;
 
 		write_state_to_file(fd, map, rows, cols, new_state);
-		flock(fd, LOCK_UN);
+		unlockfile(fd);
 
 		if (new_state != 0) break;
 	}
@@ -509,6 +520,7 @@ void snake_process(const char *state_file, int rows, int cols)
 	_exit(0);
 }
 
+/* Child 2: Wolf movement (every 1 second) */
 void wolf_process(const char *state_file, int rows, int cols)
 {
 	int **map = allocate_map(rows, cols);
@@ -525,22 +537,22 @@ void wolf_process(const char *state_file, int rows, int cols)
 	while (1) {
 		nanosleep(&ts, 0);
 
-		flock(fd, LOCK_EX);
+		lockfile(fd);
 
 		int state;
 		if (read_state_from_file(fd, map, rows, cols, &state) < 0) {
-			flock(fd, LOCK_UN);
+			unlockfile(fd);
 			break;
 		}
 
 		if (state != 0) {
-			flock(fd, LOCK_UN);
+			unlockfile(fd);
 			break;
 		}
 
 		if (find_position(map, rows, cols, 2, &pr, &pc) != 0 ||
 		    find_position(map, rows, cols, 5, &wr, &wc) != 0) {
-			flock(fd, LOCK_UN);
+			unlockfile(fd);
 			break;
 		}
 
@@ -550,7 +562,7 @@ void wolf_process(const char *state_file, int rows, int cols)
 		if (attacked) new_state = 2;
 
 		write_state_to_file(fd, map, rows, cols, new_state);
-		flock(fd, LOCK_UN);
+		unlockfile(fd);
 
 		if (new_state != 0) break;
 	}
@@ -588,7 +600,7 @@ int main(int argc, char *argv[])
 	close(orig_fd);
 
 	int **map;
-	int rows, cols, state;
+	int rows, cols, state, status;
 	if (!parse_map_buffer(buf, &map, &rows, &cols, &state)) {
 		char *msg = "Error: Failed to parse map.\n";
 		write(2, msg, my_strlen(msg));
@@ -609,7 +621,12 @@ int main(int argc, char *argv[])
 	/* show map */
 	display_map(map, rows, cols);
 
-	/* fork snake */
+	/* Multiprocess execution path
+	 * Parent forks two children, then runs the player-input loop.
+	 * All three processes synchronise via the shared state file.
+	 */
+
+	/* fork snake → Child 1: snake_process() */
 	pid_t snake_pid = fork();
 	if (snake_pid < 0) {
 		char *msg = "Error: fork() failed.\n";
@@ -618,25 +635,27 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 	if (snake_pid == 0) {
+		/* Child 1 path: runs snake_process(), never returns */
 		free_map(map, rows);
 		snake_process(STATE_FILE, rows, cols);
 	}
 
-	/* fork wolf */
+	/* fork wolf → Child 2: wolf_process() */
 	pid_t wolf_pid = fork();
 	if (wolf_pid < 0) {
 		char *msg = "Error: fork() failed.\n";
 		write(2, msg, my_strlen(msg));
 		free_map(map, rows);
-		wait(0);
+		wait(&status);
 		return 1;
 	}
 	if (wolf_pid == 0) {
+		/* Child 2 path: runs wolf_process(), never returns */
 		free_map(map, rows);
 		wolf_process(STATE_FILE, rows, cols);
 	}
 
-	/* parent: player */
+	/* Parent path continues below */
 	struct termios saved;
 	set_noncanonical(&saved);
 
@@ -644,8 +663,8 @@ int main(int argc, char *argv[])
 	if (state_fd_parent < 0) {
 		restore_terminal(&saved);
 		free_map(map, rows);
-		wait(0);
-		wait(0);
+		wait(&status);
+		wait(&status);
 		return 1;
 	}
 
@@ -656,23 +675,23 @@ int main(int argc, char *argv[])
 		char ch;
 		int n = read(0, &ch, 1);
 
-		flock(state_fd_parent, LOCK_EX);
+		lockfile(state_fd_parent);
 
 		int cur_state;
 		if (read_state_from_file(state_fd_parent, map, rows, cols, &cur_state) < 0) {
-			flock(state_fd_parent, LOCK_UN);
+			unlockfile(state_fd_parent);
 			break;
 		}
 
 		if (cur_state != 0) {
 			final_state = cur_state;
 			game_over = 1;
-			flock(state_fd_parent, LOCK_UN);
+			unlockfile(state_fd_parent);
 			break;
 		}
 
 		if (n <= 0) {
-			flock(state_fd_parent, LOCK_UN);
+			unlockfile(state_fd_parent);
 			display_map(map, rows, cols);
 			{
 				struct timespec ts = { 0, 200000000 };
@@ -710,7 +729,7 @@ int main(int argc, char *argv[])
 		}
 
 		write_state_to_file(state_fd_parent, map, rows, cols, final_state);
-		flock(state_fd_parent, LOCK_UN);
+		unlockfile(state_fd_parent);
 
 		if (!game_over) display_map(map, rows, cols);
 	}
@@ -723,9 +742,9 @@ int main(int argc, char *argv[])
 
 	close(state_fd_parent);
 
-	/* wait children */
-	wait(0);
-	wait(0);
+	/* Parent waits for both child processes to finish */
+	wait(&status);
+	wait(&status);
 
 	free_map(map, rows);
 	return 0;
