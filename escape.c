@@ -75,6 +75,7 @@ int **allocate_map(int rows, int cols)
 	for (int i = 0; i < rows; i++) {
 		map[i] = (int *)malloc(sizeof(int) * cols);
 		if (!map[i]) {
+			/* memory leak: clean up partial allocation on failure */
 			for (int j = 0; j < i; j++) free(map[j]);
 			free(map);
 			return 0;
@@ -92,16 +93,19 @@ void free_map(int **map, int rows)
 
 /* file io */
 
+/* flock: acquire exclusive file lock */
 void lockfile(int fd)
 {
 	flock(fd, LOCK_EX);
 }
 
+/* flock: release exclusive file lock */
 void unlockfile(int fd)
 {
 	flock(fd, LOCK_UN);
 }
 
+/* read: read raw bytes from fd */
 int read_file_to_buffer(int fd, char *buf, int max_size)
 {
 	int total = 0, n;
@@ -202,6 +206,7 @@ int write_state_to_file(int fd, int **map, int rows, int cols, int state)
 	int len;
 	build_state_string(map, rows, cols, state, buf, &len);
 	lseek(fd, 0, SEEK_SET);
+	/* write: write buffer to fd, ftruncate to new size */
 	if (write(fd, buf, len) != len) return -1;
 	ftruncate(fd, len);
 	return 0;
@@ -212,16 +217,19 @@ int write_state_to_file(int fd, int **map, int rows, int cols, int state)
 void set_noncanonical(struct termios *saved)
 {
 	struct termios newt;
+	/* tcgetattr: save current terminal attributes */
 	tcgetattr(0, saved);
 	newt = *saved;
 	newt.c_lflag &= ~(ICANON | ECHO);
 	newt.c_cc[VMIN] = 0;
 	newt.c_cc[VTIME] = 10;
+	/* tcsetattr: apply non-canonical terminal settings */
 	tcsetattr(0, TCSANOW, &newt);
 }
 
 void restore_terminal(struct termios *saved)
 {
+	/* tcsetattr: restore original terminal settings */
 	tcsetattr(0, TCSANOW, saved);
 }
 
@@ -277,6 +285,7 @@ void build_display(int **map, int rows, int cols, char *buf, int *len)
 		buf_append_char(buf, len, '*');
 	buf_append_char(buf, len, '\n');
 
+	/* wasd keys displayed */
 	buf_append_str(buf, len, "Press w to move UP\n");
 	buf_append_str(buf, len, "Press s to move DOWN\n");
 	buf_append_str(buf, len, "Press a to move LEFT\n");
@@ -288,6 +297,7 @@ void display_map(int **map, int rows, int cols)
 	char buf[MAX_DISPLAY_BUF];
 	int len;
 	build_display(map, rows, cols, buf, &len);
+	/* no printf/scanf: all output via write() system call */
 	write(1, buf, len);
 }
 
@@ -395,6 +405,7 @@ int is_adjacent_wolf(int wr, int wc, int pr, int pc)
 
 /* enemy */
 
+/* snake: 8 directions including diagonals */
 void get_snake_dirs(int *drs, int *dcs)
 {
 	drs[0] = -1; dcs[0] = -1;
@@ -407,6 +418,7 @@ void get_snake_dirs(int *drs, int *dcs)
 	drs[7] = 1;  dcs[7] = 1;
 }
 
+/* wolf: 4 directions (cardinal only) */
 void get_wolf_dirs(int *drs, int *dcs)
 {
 	drs[0] = -1; dcs[0] = 0;
@@ -466,7 +478,7 @@ int move_enemy_random(int **map, int rows, int cols, int *er, int *ec,
 	return 0;
 }
 
-/* processes
+/* processes */
 
 /* Child 1: Snake movement (every 2 seconds) */
 void snake_process(const char *state_file, int rows, int cols)
@@ -483,8 +495,10 @@ void snake_process(const char *state_file, int rows, int cols)
 	struct timespec ts = { SNAKE_SLEEP, 0 };
 
 	while (1) {
+		/* nanosleep: sleep 2 seconds between snake moves */
 		nanosleep(&ts, 0);
 
+		/* flock via lockfile: lock state file */
 		lockfile(fd);
 
 		int state;
@@ -515,6 +529,7 @@ void snake_process(const char *state_file, int rows, int cols)
 		if (new_state != 0) break;
 	}
 
+	/* memory leak: free map and close fd before exit */
 	free_map(map, rows);
 	close(fd);
 	_exit(0);
@@ -535,8 +550,10 @@ void wolf_process(const char *state_file, int rows, int cols)
 	struct timespec ts = { WOLF_SLEEP, 0 };
 
 	while (1) {
+		/* nanosleep: sleep 1 second between wolf moves */
 		nanosleep(&ts, 0);
 
+		/* flock via lockfile: lock state file */
 		lockfile(fd);
 
 		int state;
@@ -567,6 +584,7 @@ void wolf_process(const char *state_file, int rows, int cols)
 		if (new_state != 0) break;
 	}
 
+	/* memory leak: free map and close fd before exit */
 	free_map(map, rows);
 	close(fd);
 	_exit(0);
@@ -576,13 +594,15 @@ void wolf_process(const char *state_file, int rows, int cols)
 
 int main(int argc, char *argv[])
 {
+	/* error handling: validate exactly 2 arguments */
 	if (argc != 2) {
 		char *msg = "Usage: ./escape <filename>\n";
 		write(2, msg, my_strlen(msg));
 		return 1;
 	}
 
-	/* read map file */
+	/* read: read entire map file into buffer */
+	/* open: open map file for reading */
 	int orig_fd = open(argv[1], O_RDONLY);
 	if (orig_fd < 0) {
 		char *msg = "Error: Cannot open map file.\n";
@@ -594,9 +614,11 @@ int main(int argc, char *argv[])
 	if (read_file_to_buffer(orig_fd, buf, MAX_STATE_BUF) <= 0) {
 		char *msg = "Error: Cannot read map file.\n";
 		write(2, msg, my_strlen(msg));
+		/* close: close file descriptor on error */
 		close(orig_fd);
 		return 1;
 	}
+	/* close: close file descriptor after reading */
 	close(orig_fd);
 
 	int **map;
@@ -612,6 +634,7 @@ int main(int argc, char *argv[])
 	if (state_fd < 0) {
 		char *msg = "Error: Cannot create state file.\n";
 		write(2, msg, my_strlen(msg));
+		/* memory leak: free map before error exit */
 		free_map(map, rows);
 		return 1;
 	}
@@ -626,43 +649,50 @@ int main(int argc, char *argv[])
 	 * All three processes synchronise via the shared state file.
 	 */
 
-	/* fork snake → Child 1: snake_process() */
+	/* fork: create child process 1 for snake movement */
 	pid_t snake_pid = fork();
 	if (snake_pid < 0) {
 		char *msg = "Error: fork() failed.\n";
 		write(2, msg, my_strlen(msg));
+		/* memory leak: free map before error exit */
 		free_map(map, rows);
 		return 1;
 	}
 	if (snake_pid == 0) {
-		/* Child 1 path: runs snake_process(), never returns */
+		/* child process: free parent's map copy, run snake loop */
 		free_map(map, rows);
 		snake_process(STATE_FILE, rows, cols);
 	}
 
-	/* fork wolf → Child 2: wolf_process() */
+	/* fork: create child process 2 for wolf movement */
 	pid_t wolf_pid = fork();
 	if (wolf_pid < 0) {
 		char *msg = "Error: fork() failed.\n";
 		write(2, msg, my_strlen(msg));
+		/* memory leak: free map before error exit */
 		free_map(map, rows);
+		/* wait: reap snake child before exit */
 		wait(&status);
 		return 1;
 	}
 	if (wolf_pid == 0) {
-		/* Child 2 path: runs wolf_process(), never returns */
+		/* child process: free parent's map copy, run wolf loop */
 		free_map(map, rows);
 		wolf_process(STATE_FILE, rows, cols);
 	}
 
 	/* Parent path continues below */
 	struct termios saved;
+	/* tcgetattr/tcsetattr: set non-canonical terminal mode for player input */
 	set_noncanonical(&saved);
 
+	/* open: reopen state file for parent process */
 	int state_fd_parent = open(STATE_FILE, O_RDWR);
 	if (state_fd_parent < 0) {
 		restore_terminal(&saved);
+		/* memory leak: free map before error exit */
 		free_map(map, rows);
+		/* wait: reap both children before error exit */
 		wait(&status);
 		wait(&status);
 		return 1;
@@ -673,8 +703,10 @@ int main(int argc, char *argv[])
 
 	while (!game_over) {
 		char ch;
+		/* read: read single keystroke from stdin (non-blocking) */
 		int n = read(0, &ch, 1);
 
+		/* flock via lockfile: lock state file */
 		lockfile(state_fd_parent);
 
 		int cur_state;
@@ -694,12 +726,14 @@ int main(int argc, char *argv[])
 			unlockfile(state_fd_parent);
 			display_map(map, rows, cols);
 			{
+				/* nanosleep: sleep 200ms to avoid busy-waiting */
 				struct timespec ts = { 0, 200000000 };
 				nanosleep(&ts, 0);
 			}
 			continue;
 		}
 
+		/* wasd keys: map w/s/a/d to up/down/left/right movement */
 		int dr = 0, dc = 0;
 		switch (ch) {
 		case 'w': case 'W': dr = -1; break;
@@ -740,12 +774,14 @@ int main(int argc, char *argv[])
 	if (game_over && final_state != 0)
 		display_game_over(map, rows, cols, final_state);
 
+	/* close: close state file descriptor */
 	close(state_fd_parent);
 
-	/* Parent waits for both child processes to finish */
+	/* wait: parent reaps both child processes to prevent zombies */
 	wait(&status);
 	wait(&status);
 
+	/* memory leak: free map before exit */
 	free_map(map, rows);
 	return 0;
 }

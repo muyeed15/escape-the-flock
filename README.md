@@ -98,3 +98,9 @@ Synchronization via `lockfile(fd)` / `unlockfile(fd)` wrappers around `flock()` 
 ```sh
 make clean
 ```
+
+## Leak Test
+
+```sh
+./leak_test.sh
+```
